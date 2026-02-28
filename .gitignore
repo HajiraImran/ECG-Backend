@@ -1,0 +1,17 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Security Keys (CRITICAL)
+firebase_key.json
+
+# IDE Settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
