@@ -3,7 +3,7 @@ name: Deploy to AWS Lambda
 on:
   push:
     branches:
-      - main  # This triggers the robot whenever you push to the 'main' branch
+      - main
 
 jobs:
   deploy:
@@ -20,6 +20,12 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+    # --- YAHAN FIX HAI ---
+    # Ye step secret se data utha kar file banaye ga taake Docker ko file mil jaye
+    - name: Create Firebase Key File
+      run: |
+        echo '${{ secrets.FIREBASE_KEY_JSON }}' > firebase_key.json
+
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
@@ -27,12 +33,10 @@ jobs:
     - name: Build, Tag, and Push Image to ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ecg-backend  # Your ECR repo name
+        ECR_REPOSITORY: ecg-backend
         IMAGE_TAG: latest
       run: |
-        # Build the Docker image
         docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        # Push the image to ECR
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
     - name: Update Lambda Function
