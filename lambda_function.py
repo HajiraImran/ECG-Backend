@@ -45,17 +45,31 @@ def extract_features(signal, fs=250):
 
 def handler(event, context):
     try:
-        # Step A: Request Parsing
-        if isinstance(event.get('body'), str):
-            body = json.loads(event['body'])
-        else:
-            body = event
-            
-        uid = body.get('uid')
+        # --- STEP A: Enhanced Request Parsing ---
+        uid = None
+
+        # 1. Check URL Query Parameters (For Browser/ESP32 URL hits)
+        if event.get('queryStringParameters'):
+            uid = event['queryStringParameters'].get('uid')
+
+        # 2. Check JSON Body (For POST requests/Mobile App)
         if not uid:
-            return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
+            if isinstance(event.get('body'), str):
+                body = json.loads(event['body'])
+                uid = body.get('uid')
+            elif isinstance(event, dict):
+                uid = event.get('uid')
+
+        # If still no UID, return error
+        if not uid:
+            return {
+                'statusCode': 400, 
+                'body': json.dumps("Error: Missing uid. Please provide ?uid=YOUR_ID in the URL")
+            }
 
         # Step B: Firebase Snapshot
+        print(f"Processing data for UID: {uid}")
+        ref = db.reference(f'users/{uid}/ecg_data')
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
         
