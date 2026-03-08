@@ -117,12 +117,30 @@ def handler(event, context):
             "Timestamp": data_entry.get('timestamp', 'N/A')
         }
 
-        # Step E: Results Save
-        db.reference(f'users/{uid}/results').set(final_results)
+        # --- Step E: Results Save (REPLACED) ---
+        
+        # 1. Dashboard ke liye (Latest Results)
+        db.reference(f'users/{uid}/latest_results').set(final_results)
 
+        # 2. History Screen ke liye (Specific Entry ke andar)
+        # Is se 'ecg_data' ke us khaas ID mein results save ho jayenge
+        db.reference(f'users/{uid}/ecg_data/{key}/results').set({
+            "Potassium": final_results["Potassium"],
+            "Calcium": final_results["Calcium"],
+            "Magnesium": final_results["Magnesium"],
+            "BPM": bpm_from_esp32,
+            "Overall_Status": final_results.get("Overall_Status", "Normal")
+        })
+
+        print(f"Successfully saved results for UID: {uid} in History and Latest")
+
+        # --- Final Response ---
         return {
             'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*'},
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps(final_results)
         }
 
