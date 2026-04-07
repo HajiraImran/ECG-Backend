@@ -24,30 +24,28 @@ def get_level(value, low, high):
     else: return "NORMAL ✓"
 
 def extract_features(signal, fs=250):
-    """
-    DYNAMIC FEATURE EXTRACTION:
-    Hardcoded values ki jagah asli signal se intervals nikalta hai.
-    """
     signal = np.array(signal)
     
-    # --- Step 1: Bandpass Filter (Baseline Wander & High Frequency Noise Removal) ---
+    # --- Step 1: Bandpass Filter ---
     nyq = 0.5 * fs
     low, high = 0.5 / nyq, 40.0 / nyq
     b, a = butter(1, [low, high], btype='band')
     filtered = lfilter(b, a, signal)
     
-    # --- Step 2: Strict R-Peak Detection ---
-    # distance=fs*0.5 matlab 120 BPM se zyada allow nahi (noise filter)
+    # --- Step 2: Flexible R-Peak Detection (UPDATED) ---
+    # Prominence 1.5 se kam kar ke 0.7 kiya taake round peaks bhi mil jayen
+    # Distance 0.5s se kam kar ke 0.3s kiya (BPM range 40-200 allow)
     peaks, _ = find_peaks(filtered, 
-                          distance=int(fs*0.5), 
-                          prominence=np.std(filtered) * 1.5,
-                          height=np.mean(filtered))
+                          distance=int(fs*0.3), 
+                          prominence=np.std(filtered) * 0.7,
+                          height=None) # Height check hata diya taake baseline shift masla na kare
     
-    # Agar signal bohot ganda hai aur 3 peaks bhi nahi mil rahi:
+    # Minimum 3 peaks zaroori hain features ke liye
     if len(peaks) < 3:
+        print(f"[DEBUG] Only {len(peaks)} peaks found. Signal quality poor.")
         return None
 
-    # --- Step 3: Calculate Intervals (In milliseconds) ---
+    # --- Step 3: Calculate Intervals ---
     rr_intervals = np.diff(peaks) * (1000 / fs)
     rr_avg = np.mean(rr_intervals)
     
@@ -55,15 +53,15 @@ def extract_features(signal, fs=250):
     qt_list = []
 
     for r in peaks[1:-1]:
-        # QRS Window: R ke aage piche scan
+        # QRS Window: R ke aage piche 40ms
         q_idx = r - int(0.04 * fs)
         s_idx = r + int(0.04 * fs)
         qrs_ms = (s_idx - q_idx) * (1000 / fs)
         qrs_list.append(qrs_ms)
         
-        # QT/T-Wave Window: R ke baad 350ms ka area
+        # QT Window: R ke baad T-wave dhoondna
         t_start = r + int(0.1 * fs)
-        t_end = r + int(0.4 * fs)
+        t_end = r + int(0.45 * fs) # Window thodi barhai (0.4 to 0.45)
         if t_end < len(filtered):
             t_segment = filtered[t_start:t_end]
             t_peak_relative = np.argmax(t_segment)
@@ -71,12 +69,12 @@ def extract_features(signal, fs=250):
             qt_ms = (t_peak_idx - q_idx) * (1000 / fs)
             qt_list.append(qt_ms)
 
-    # Medians use kar rahe hain taake abnormal spikes result kharab na karein
+    # Medians calculate karein
     qrs_avg = np.median(qrs_list) if qrs_list else 95.0
     qt_avg = np.median(qt_list) if qt_list else 400.0
     qtc_avg = qt_avg / np.sqrt(rr_avg / 1000)
 
-    # PR Interval & Axis (Single Lead limitation ki wajah se safe defaults)
+    # Defaults for single lead
     pr_avg = 160.0 
     p_axis, qrs_axis, t_axis = 50.0, 60.0, 45.0
 
@@ -84,18 +82,15 @@ def extract_features(signal, fs=250):
 
 def handler(event, context):
     try:
-        # --- Step A: Request Parsing ---
-        uid = None
-        if event.get('queryStringParameters'):
-            uid = event['queryStringParameters'].get('uid')
-        if not uid and event.get('body'):
-            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-            uid = body.get('uid')
+        # Request Parsing
+        body = event.get('body', {})
+        if isinstance(body, str): body = json.loads(body)
+        uid = body.get('uid') or (event.get('queryStringParameters', {}).get('uid'))
 
         if not uid:
             return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
 
-        # --- Step B: Get Latest Data from Firebase ---
+        # Get Latest Data
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
         
@@ -106,43 +101,38 @@ def handler(event, context):
         data_entry = snapshot[key]
         raw_ecg_values = data_entry.get('values')
 
-        if not raw_ecg_values:
-            return {'statusCode': 404, 'body': json.dumps("Error: Values missing")}
-
-        # --- Step C: Feature Extraction & Validation ---
+        # Feature Extraction
         features = extract_features(raw_ecg_values, fs=250)
         
-        # Agar signal quality poor hai:
         if features is None:
+            # Dashboard update karein taake user ko pata chale signal kharab tha
+            db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
             return {
                 'statusCode': 422,
-                'body': json.dumps({"error": "Poor signal quality. Please stay still and retry."})
+                'body': json.dumps({"error": "Poor signal quality. Check electrode placement."})
             }
 
-        # --- Step D: Prediction ---
+        # Prediction
         features_scaled = SCALER.transform([features])
         preds = MODEL.predict(features_scaled)
         
-        # Regression outputs
         reg_out = preds[1][0]
         k_val = round(float(reg_out[0]), 2)
         ca_val = round(float(reg_out[1]), 2)
         mg_val = round(float(reg_out[2]), 2)
 
-        # Result Formatting
+        # Formatting
         final_results = {
             "Potassium": {"Value": k_val, "Level": get_level(k_val, 3.5, 5.0), "Unit": "mEq/L"},
             "Calcium": {"Value": ca_val, "Level": get_level(ca_val, 8.5, 10.5), "Unit": "mg/dL"},
             "Magnesium": {"Value": mg_val, "Level": get_level(mg_val, 1.7, 2.2), "Unit": "mg/dL"},
             "BPM": round(60000 / features[0], 1),
-            "Status": "Normal" if all(get_level(v, l, h) == "NORMAL ✓" for v, l, h in [(k_val,3.5,5.0), (ca_val,8.5,10.5), (mg_val,1.7,2.2)]) else "Imbalanced",
-            "Timestamp": data_entry.get('timestamp')
+            "Status": "NORMAL ✓" if all(get_level(v, l, h) == "NORMAL ✓" for v, l, h in [(k_val,3.5,5.0), (ca_val,8.5,10.5), (mg_val,1.7,2.2)]) else "Imbalanced",
+            "Timestamp": data_entry.get('timestamp', 0)
         }
 
-        # --- Step E: Save Results back to Firebase ---
-        # 1. Update Latest Results
+        # Save to Firebase
         db.reference(f'users/{uid}/latest_results').set(final_results)
-        # 2. Append to history entry
         db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
 
         return {
