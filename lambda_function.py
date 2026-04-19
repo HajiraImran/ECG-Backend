@@ -6,15 +6,13 @@ import firebase_admin
 from firebase_admin import credentials, db
 from scipy.signal import find_peaks, butter, filtfilt
 
-# --- KERAS 3 & VERSION COMPATIBILITY FIX ---
-os.environ["KERAS_BACKEND"] = "tensorflow"
+# --- NATIVE TENSORFLOW FIX (Keras 3 Standalone removed) ---
 import tensorflow as tf
-import keras
-from keras.layers import Dense
 
-# Colab 2.19 compatibility ke liye quantization_config ko ignore karne wali class
-class CustomDense(Dense):
+# Custom class to handle Colab 2.19 quantization parameters
+class CustomDense(tf.keras.layers.Dense):
     def __init__(self, **kwargs):
+        # Naye versions ke faltu parameters ko nikal dena
         kwargs.pop('quantization_config', None)
         super().__init__(**kwargs)
 
@@ -23,7 +21,7 @@ MODEL = None
 SCALER = None
 TARGET_SCALER = None
 
-# 1. Firebase Initialization (Handler ke bahar theek hai)
+# 1. Firebase Initialization
 if not firebase_admin._apps:
     cred = credentials.Certificate('firebase_key.json')
     firebase_admin.initialize_app(cred, {
@@ -86,11 +84,12 @@ def lambda_handler(event, context):
     global MODEL, SCALER, TARGET_SCALER
     
     try:
-        # 1. Lazy Loading (Init Timeout Fix)
+        # 1. Lazy Loading with Native TF-Keras
         if MODEL is None:
-            print("Loading Model and Scalers...")
-            # Custom Objects use kar rahe hain Colab Compatibility ke liye
+            print("Initializing model loading...")
             custom_objects = {'Dense': CustomDense}
+            
+            # Using tf.keras instead of standalone keras
             MODEL = tf.keras.models.load_model(
                 'my_model.h5', 
                 custom_objects=custom_objects, 
@@ -98,12 +97,10 @@ def lambda_handler(event, context):
             )
             SCALER = joblib.load('scaler.pkl')
             TARGET_SCALER = joblib.load('target_scaler.pkl')
-            print("Model Loaded Successfully!")
+            print("Model and Scalers loaded successfully!")
 
-        # 2. Request Parsing
-        # Direct event check for Test Console
-        uid = event.get('userId') 
-        # API Gateway check
+        # 2. Request Parsing (Supporting both direct Test and API Gateway)
+        uid = event.get('userId')
         if not uid and 'body' in event:
             body = event['body']
             if isinstance(body, str): body = json.loads(body)
@@ -112,12 +109,12 @@ def lambda_handler(event, context):
         if not uid:
             return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
 
-        # 3. Firebase Fetch
+        # 3. Firebase Data Fetch
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
         
         if not snapshot:
-            return {'statusCode': 404, 'body': json.dumps("Error: No data found")}
+            return {'statusCode': 404, 'body': json.dumps("Error: No data found in Firebase")}
 
         key = list(snapshot.keys())[0]
         data_entry = snapshot[key]
@@ -129,19 +126,21 @@ def lambda_handler(event, context):
             db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
             return {'statusCode': 422, 'body': json.dumps("Poor signal quality")}
 
-        # 5. Prediction
+        # 5. Prediction Logic
         features_scaled = SCALER.transform([features])
         preds = MODEL.predict(features_scaled, verbose=0)
         
-        # Classification & Regression outputs
+        # Binary Classification (Imbalance)
         is_imbalanced = float(preds[0][0]) > 0.5 
+        
+        # Regression (Electrolyte levels)
         reg_out_real = TARGET_SCALER.inverse_transform(preds[1])[0]
         
         k_val = round(float(reg_out_real[0]), 2)
         ca_val = round(float(reg_out_real[1]), 2)
         mg_val = round(float(reg_out_real[2]), 2)
 
-        # 6. Final Object
+        # 6. Result Construction
         final_results = {
             "Potassium": {"Value": k_val, "Level": get_level(k_val, 3.5, 5.0), "Range": "3.5 - 5.0", "Unit": "mEq/L"},
             "Calcium": {"Value": ca_val, "Level": get_level(ca_val, 8.5, 10.5), "Range": "8.5 - 10.5", "Unit": "mg/dL"},
@@ -151,13 +150,16 @@ def lambda_handler(event, context):
             "Timestamp": data_entry.get('timestamp', 0)
         }
 
-        # Update Firebase
+        # Update Firebase Locations
         db.reference(f'users/{uid}/latest_results').set(final_results)
         db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
 
         return {
             'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps(final_results)
         }
 
