@@ -1,5 +1,4 @@
 import json
-import os
 import numpy as np
 import tensorflow as tf
 import joblib
@@ -7,66 +6,50 @@ import firebase_admin
 from firebase_admin import credentials, db
 from scipy.signal import find_peaks, butter, lfilter
 
-# --- STEP 1: ULTIMATE COMPATIBILITY PATCH (For Colab 2.19 Model) ---
-def robust_load_model(model_path):
-    class CustomDense(tf.keras.layers.Dense):
-        def __init__(self, **kwargs):
-            kwargs.pop('quantization_config', None)
-            super().__init__(**kwargs)
-
-    class CustomInputLayer(tf.keras.layers.InputLayer):
-        def __init__(self, **kwargs):
-            kwargs.pop('batch_shape', None)
-            kwargs.pop('optional', None)
-            kwargs.pop('sparse', None)
-            kwargs.pop('ragged', None)
-            super().__init__(**kwargs)
-
-    custom_objects = {'Dense': CustomDense, 'InputLayer': CustomInputLayer}
-    return tf.keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
-
-# --- STEP 2: Firebase Initialization ---
+# --- Firebase ---
 if not firebase_admin._apps:
     cred = credentials.Certificate('firebase_key.json')
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://trilyte-37e53-default-rtdb.firebaseio.com'
     })
 
-# --- STEP 3: Load Model & Scalers (Global) ---
-# Hum handler ke bahar rakh rahe hain kyunki aapka environment stable hai
-MODEL = robust_load_model('my_model.h5')
-SCALER = joblib.load('scaler.pkl') 
-# Agar aapke naye model mein target_scaler hai toh wo bhi load kar lein:
-# TARGET_SCALER = joblib.load('target_scaler.pkl')
+# --- ✅ MODEL LOAD (FINAL FIX) ---
+MODEL = tf.keras.models.load_model('model_dir')
+SCALER = joblib.load('scaler.pkl')
+TARGET_SCALER = joblib.load('target_scaler.pkl')
 
+# --- Utils ---
 def get_level(value, low, high):
     if value < low: return "LOW ⬇"
     elif value > high: return "HIGH ⬆"
     else: return "NORMAL ✓"
 
+# --- Feature Extraction ---
 def extract_features(signal, fs=250):
     signal = np.array(signal)
+    
     nyq = 0.5 * fs
     low, high = 1.0 / nyq, 35.0 / nyq 
     b, a = butter(1, [low, high], btype='band')
     filtered = lfilter(b, a, signal)
-    
+
     peaks, _ = find_peaks(filtered, 
                           distance=int(fs*0.3), 
                           prominence=np.std(filtered) * 0.7) 
-    
-    if len(peaks) < 3: return None
+
+    if len(peaks) < 3:
+        return None
 
     rr_intervals = np.diff(peaks) * (1000 / fs)
-    rr_avg = np.mean(rr_intervals)
-    
+    RR = np.mean(rr_intervals)
+
     qrs_list, qt_list = [], []
     for r in peaks[1:-1]:
         q_idx = r - int(0.04 * fs)
         s_idx = r + int(0.04 * fs)
         qrs_ms = (s_idx - q_idx) * (1000 / fs)
         qrs_list.append(qrs_ms)
-        
+
         t_start, t_end = r + int(0.1 * fs), r + int(0.45 * fs)
         if t_end < len(filtered):
             t_segment = filtered[t_start:t_end]
@@ -74,71 +57,65 @@ def extract_features(signal, fs=250):
             qt_ms = (t_peak_idx - q_idx) * (1000 / fs)
             qt_list.append(qt_ms)
 
-    qrs_avg = np.median(qrs_list) if qrs_list else 95.0
-    qt_avg = np.median(qt_list) if qt_list else 400.0
-    qtc_avg = qt_avg / np.sqrt(rr_avg / 1000)
+    QRS = np.median(qrs_list) if qrs_list else 95.0
+    QT  = np.median(qt_list) if qt_list else 400.0
+    QTc = QT / np.sqrt(RR / 1000)
 
-    return [rr_avg, 160.0, qrs_avg, qt_avg, qtc_avg, 50.0, 60.0, 45.0]
+    # 8 features match training
+    return [RR, 160.0, QRS, QT, QTc, 60.0, 60.0, 45.0]
 
+# --- Handler ---
 def handler(event, context):
     try:
-        # Request Parsing
         body = event.get('body', {})
-        if isinstance(body, str): body = json.loads(body)
+        if isinstance(body, str):
+            body = json.loads(body)
+
         uid = body.get('uid') or (event.get('queryStringParameters', {}).get('uid'))
 
         if not uid:
-            return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
+            return {'statusCode': 400, 'body': json.dumps("Missing uid")}
 
-        # Get Latest Data from Firebase
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
-        
+
         if not snapshot:
-            return {'statusCode': 404, 'body': json.dumps("Error: No data found")}
+            return {'statusCode': 404, 'body': json.dumps("No data")}
 
         key = list(snapshot.keys())[0]
         data_entry = snapshot[key]
         raw_ecg_values = data_entry.get('values')
 
-        # Feature Extraction
-        features = extract_features(raw_ecg_values, fs=250)
-        if features is None:
-            db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
-            return {'statusCode': 422, 'body': json.dumps({"error": "Poor signal quality"})}
+        features = extract_features(raw_ecg_values)
 
-        # AI Prediction
+        if features is None:
+            return {'statusCode': 422, 'body': json.dumps("Poor signal")}
+
+        # --- Prediction ---
         features_scaled = SCALER.transform([features])
-        preds = MODEL.predict(features_scaled, verbose=0)
-        
-        # NOTE: Agar aapka naye model ke outputs change hain toh is line ko adjust karein
-        # Maslan: reg_out = preds[1][0] agar multi-output model hai
-        reg_out = preds[1][0] if isinstance(preds, list) else preds[0]
-        
-        # --- Value Adjustments (Offsets as per your old logic) ---
-        k_val = round(float(reg_out[0]), 2)
-        ca_val = round(float(reg_out[1]) + 3.0, 2) 
-        mg_val = round(float(reg_out[2]) + 1.2, 2) 
+        pred_class, pred_reg_scaled = MODEL.predict(features_scaled, verbose=0)
+
+        # --- Convert back ---
+        pred_reg = TARGET_SCALER.inverse_transform(pred_reg_scaled)[0]
+
+        k_val  = round(float(pred_reg[0]), 2)
+        ca_val = round(float(pred_reg[1]), 2)
+        mg_val = round(float(pred_reg[2]), 2)
 
         final_results = {
-            "Potassium": {"Value": k_val, "Level": get_level(k_val, 3.5, 5.0), "Range": "3.5 - 5.0", "Unit": "mEq/L"},
-            "Calcium": {"Value": ca_val, "Level": get_level(ca_val, 8.5, 10.5), "Range": "8.5 - 10.5", "Unit": "mg/dL"},
-            "Magnesium": {"Value": mg_val, "Level": get_level(mg_val, 1.7, 2.2), "Range": "1.7 - 2.2", "Unit": "mg/dL"},
+            "Potassium": {"Value": k_val, "Level": get_level(k_val, 3.5, 5.0)},
+            "Calcium": {"Value": ca_val, "Level": get_level(ca_val, 8.5, 10.5)},
+            "Magnesium": {"Value": mg_val, "Level": get_level(mg_val, 1.7, 2.2)},
             "BPM": round(60000 / features[0], 1),
-            "Status": "Normal",
-            "Timestamp": data_entry.get('timestamp', 0)
+            "Status": "OK"
         }
 
-        # Update Firebase
         db.reference(f'users/{uid}/latest_results').set(final_results)
-        db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
 
         return {
             'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
             'body': json.dumps(final_results)
         }
 
     except Exception as e:
-        print(f"System Error: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps({"details": str(e)})}
+        return {'statusCode': 500, 'body': json.dumps(str(e))}
