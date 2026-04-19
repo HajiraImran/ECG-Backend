@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir \
 COPY lambda_function.py .
 COPY my_model.h5 .
 COPY scaler.pkl .
+COPY target_scaler.pkl .
 COPY firebase_key.json .
 
 # Lambda handler

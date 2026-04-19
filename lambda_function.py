@@ -5,18 +5,21 @@ import tensorflow as tf
 import joblib
 import firebase_admin
 from firebase_admin import credentials, db
-from scipy.signal import find_peaks, butter, lfilter
+from scipy.signal import find_peaks, butter, filtfilt
 
 # 1. Firebase Initialization
 if not firebase_admin._apps:
+    # Ensure 'firebase_key.json' is in your backend folder
     cred = credentials.Certificate('firebase_key.json')
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://trilyte-37e53-default-rtdb.firebaseio.com'
     })
 
-# 2. Global Model & Scaler
+# 2. Global Model & Scalers (Must be in the same folder)
+# We use .h5 for better compatibility with older Lambda environments
 MODEL = tf.keras.models.load_model('my_model.h5', compile=False)
 SCALER = joblib.load('scaler.pkl') 
+TARGET_SCALER = joblib.load('target_scaler.pkl')
 
 def get_level(value, low, high):
     if value < low: return "LOW ⬇"
@@ -24,50 +27,66 @@ def get_level(value, low, high):
     else: return "NORMAL ✓"
 
 def extract_features(signal, fs=250):
-    signal = np.array(signal)
+    """
+    Extracts ECG intervals and matches the 8-feature format 
+    used during model training.
+    """
+    signal = np.array(signal, dtype=float)
     
-    # --- Step 1: Bandpass Filter ---
+    # --- Step 1: Cleaning (Bandpass Filter) ---
     nyq = 0.5 * fs
-    low, high = 1.0 / nyq, 35.0 / nyq # 1.0Hz filter for better baseline
-    b, a = butter(1, [low, high], btype='band')
-    filtered = lfilter(b, a, signal)
+    low, high = 0.5 / nyq, 40.0 / nyq 
+    b, a = butter(2, [low, high], btype='band')
+    filtered = filtfilt(b, a, signal) 
     
-    # --- Step 2: Flexible R-Peak Detection ---
-    peaks, _ = find_peaks(filtered, 
-                          distance=int(fs*0.3), 
-                          prominence=np.std(filtered) * 0.7,
-                          height=None) 
+    # Normalize
+    norm = (filtered - filtered.mean()) / filtered.std()
+    
+    # --- Step 2: R-Peak Detection ---
+    # distance=180 samples (approx 0.7s at 250Hz)
+    peaks, _ = find_peaks(norm, height=0.3, distance=150, prominence=0.5) 
     
     if len(peaks) < 3:
         return None
 
-    # --- Step 3: Calculate Intervals ---
-    rr_intervals = np.diff(peaks) * (1000 / fs)
-    rr_avg = np.mean(rr_intervals)
+    # --- Step 3: Intervals Calculation ---
+    rr_ms = np.diff(peaks) / fs * 1000
+    RR = np.mean(rr_ms)
     
-    qrs_list = []
-    qt_list = []
+    pr_list, qrs_list, qt_list = [], [], []
 
     for r in peaks[1:-1]:
-        q_idx = r - int(0.04 * fs)
-        s_idx = r + int(0.04 * fs)
-        qrs_ms = (s_idx - q_idx) * (1000 / fs)
-        qrs_list.append(qrs_ms)
+        # QRS Detection
+        q_idx = max(0, r - int(0.05 * fs)) + np.argmin(norm[max(0, r - int(0.05 * fs)):r])
+        s_idx = r + np.argmin(norm[r:min(len(norm), r + int(0.05 * fs))])
         
-        t_start = r + int(0.1 * fs)
-        t_end = r + int(0.45 * fs)
-        if t_end < len(filtered):
-            t_segment = filtered[t_start:t_end]
-            t_peak_relative = np.argmax(t_segment)
-            t_peak_idx = t_start + t_peak_relative
-            qt_ms = (t_peak_idx - q_idx) * (1000 / fs)
-            qt_list.append(qt_ms)
+        qrs_ms = (s_idx - q_idx) / fs * 1000
+        if 40 < qrs_ms < 200: qrs_list.append(qrs_ms)
+        
+        # PR Detection (P-wave search)
+        p_start, p_end = max(0, r - int(0.2 * fs)), max(0, r - int(0.06 * fs))
+        if p_end > p_start:
+            p_idx = p_start + np.argmax(norm[p_start:p_end])
+            pr_ms = (r - p_idx) / fs * 1000
+            if 80 < pr_ms < 300: pr_list.append(pr_ms)
+            
+        # QT Detection (T-wave search)
+        t_win = norm[s_idx:min(len(norm), s_idx + int(0.4 * fs))]
+        if len(t_win) > 10:
+            tp = np.argmax(t_win)
+            above = np.where(t_win[tp:] > 0.1 * t_win[tp])[0]
+            if len(above):
+                qt_ms = (s_idx + tp + above[-1] - q_idx) / fs * 1000
+                if 200 < qt_ms < 600: qt_list.append(qt_ms)
 
-    qrs_avg = np.median(qrs_list) if qrs_list else 95.0
-    qt_avg = np.median(qt_list) if qt_list else 400.0
-    qtc_avg = qt_avg / np.sqrt(rr_avg / 1000)
+    PR = np.median(pr_list) if pr_list else 160.0
+    QRS = np.median(qrs_list) if qrs_list else 85.0
+    QT = np.median(qt_list) if qt_list else 400.0
+    QTc = QT / np.sqrt(RR / 1000)
 
-    return [rr_avg, 160.0, qrs_avg, qt_avg, qtc_avg, 50.0, 60.0, 45.0]
+    # Returning 8 features to match training: [RR, PR, QRS, QT, QTc, P_axis, QRS_axis, T_axis]
+    # Axes are set to normal defaults (60, 60, 45) as raw signal axis needs multi-lead ECG.
+    return [RR, PR, QRS, QT, QTc, 60.0, 60.0, 45.0]
 
 def handler(event, context):
     try:
@@ -79,7 +98,7 @@ def handler(event, context):
         if not uid:
             return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
 
-        # Get Latest Data
+        # Fetch Data from Firebase
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
         
@@ -97,18 +116,22 @@ def handler(event, context):
             db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
             return {'statusCode': 422, 'body': json.dumps({"error": "Poor signal quality"})}
 
-        # Prediction
+        # AI Prediction
         features_scaled = SCALER.transform([features])
-        preds = MODEL.predict(features_scaled)
+        preds = MODEL.predict(features_scaled, verbose=0)
         
-        reg_out = preds[1][0]
+        # Classification (Imbalance check)
+        # preds[0] is classification, preds[1] is regression
+        is_imbalanced = preds[0][0] > 0.5 
         
-        # --- Value Adjustments (Offsets) ---
-        k_val = round(float(reg_out[0]), 2)
-        ca_val = round(float(reg_out[1]) + 3.0, 2) # Adding 3.0 to bring it into 8-10 range
-        mg_val = round(float(reg_out[2]) + 1.2, 2) # Adding 1.2 to bring it into 1.7-2.2 range
+        # Regression (Actual Values) via Target Scaler
+        reg_out_real = TARGET_SCALER.inverse_transform(preds[1])[0]
+        
+        k_val = round(float(reg_out_real[0]), 2)
+        ca_val = round(float(reg_out_real[1]), 2)
+        mg_val = round(float(reg_out_real[2]), 2)
 
-        # --- Formatting with Ranges for Dashboard ---
+        # Build Final Results Object
         final_results = {
             "Potassium": {
                 "Value": k_val, 
@@ -129,20 +152,26 @@ def handler(event, context):
                 "Unit": "mg/dL"
             },
             "BPM": round(60000 / features[0], 1),
-            "Status": "Normal", # This will replace "Analyzing" on the home screen
+            "Status": "Normal" if not is_imbalanced else "Imbalance Detected",
             "Timestamp": data_entry.get('timestamp', 0)
         }
 
-        # Save to Firebase
+        # Update Firebase
         db.reference(f'users/{uid}/latest_results').set(final_results)
         db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
 
         return {
             'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps(final_results)
         }
 
     except Exception as e:
         print(f"System Error: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps({"details": str(e)})}
+        return {
+            'statusCode': 500, 
+            'body': json.dumps({"details": str(e)})
+        }
