@@ -1,6 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 # TensorFlow 2.15 use karein kyunki ye Keras 2 use karta hai (Stable for older models)
-tensorflow-cpu==2.19.0
+tensorflow-cpu==2.16.1
+keras==3.3.3
 # Numpy ka version fix rakhein
 numpy<2.0.0,>=1.23.5
 pandas==2.1.4
