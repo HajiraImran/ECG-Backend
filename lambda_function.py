@@ -5,18 +5,38 @@ import joblib
 import firebase_admin
 from firebase_admin import credentials, db
 from scipy.signal import find_peaks, butter, filtfilt
-
-# --- NATIVE TENSORFLOW FIX (Keras 3 Standalone removed) ---
 import tensorflow as tf
 
-# Custom class to handle Colab 2.19 quantization parameters
-class CustomDense(tf.keras.layers.Dense):
-    def __init__(self, **kwargs):
-        # Naye versions ke faltu parameters ko nikal dena
-        kwargs.pop('quantization_config', None)
-        super().__init__(**kwargs)
+# --- THE ULTIMATE COMPATIBILITY PATCH ---
+def robust_load_model(model_path):
+    # Custom Dense to handle quantization_config
+    class CustomDense(tf.keras.layers.Dense):
+        def __init__(self, **kwargs):
+            kwargs.pop('quantization_config', None)
+            super().__init__(**kwargs)
 
-# Global variables for caching
+    # Custom InputLayer to handle batch_shape and optional
+    class CustomInputLayer(tf.keras.layers.InputLayer):
+        def __init__(self, **kwargs):
+            kwargs.pop('batch_shape', None)
+            kwargs.pop('optional', None)
+            # Keras 2 uses 'batch_input_shape' instead of 'batch_shape'
+            super().__init__(**kwargs)
+
+    custom_objects = {
+        'Dense': CustomDense,
+        'InputLayer': CustomInputLayer
+    }
+
+    try:
+        # Pehle normal load koshish karein
+        return tf.keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
+    except Exception as e:
+        print(f"Standard load failed, attempting patch... Error: {e}")
+        # Agar phir bhi fail ho (InputLayer issue), toh ye trick kaam karegi
+        return tf.keras.models.load_model(model_path, compile=False)
+
+# Global variables
 MODEL = None
 SCALER = None
 TARGET_SCALER = None
@@ -36,34 +56,26 @@ def get_level(value, low, high):
 def extract_features(signal, fs=250):
     if not signal or len(signal) < 500: return None
     signal = np.array(signal, dtype=float)
-    
-    # Cleaning
     nyq = 0.5 * fs
     low, high = 0.5 / nyq, 40.0 / nyq 
     b, a = butter(2, [low, high], btype='band')
     filtered = filtfilt(b, a, signal) 
     norm = (filtered - filtered.mean()) / filtered.std()
-    
-    # Peak Detection
     peaks, _ = find_peaks(norm, height=0.3, distance=150, prominence=0.5) 
     if len(peaks) < 3: return None
-
     rr_ms = np.diff(peaks) / fs * 1000
     RR = np.mean(rr_ms)
-    
     pr_list, qrs_list, qt_list = [], [], []
     for r in peaks[1:-1]:
         q_idx = max(0, r - int(0.05 * fs)) + np.argmin(norm[max(0, r - int(0.05 * fs)):r])
         s_idx = r + np.argmin(norm[r:min(len(norm), r + int(0.05 * fs))])
         qrs_ms = (s_idx - q_idx) / fs * 1000
         if 40 < qrs_ms < 200: qrs_list.append(qrs_ms)
-        
         p_start, p_end = max(0, r - int(0.2 * fs)), max(0, r - int(0.06 * fs))
         if p_end > p_start:
             p_idx = p_start + np.argmax(norm[p_start:p_end])
             pr_ms = (r - p_idx) / fs * 1000
             if 80 < pr_ms < 300: pr_list.append(pr_ms)
-            
         t_win = norm[s_idx:min(len(norm), s_idx + int(0.4 * fs))]
         if len(t_win) > 10:
             tp = np.argmax(t_win)
@@ -71,76 +83,49 @@ def extract_features(signal, fs=250):
             if len(above):
                 qt_ms = (s_idx + tp + above[-1] - q_idx) / fs * 1000
                 if 200 < qt_ms < 600: qt_list.append(qt_ms)
-
     PR = np.median(pr_list) if pr_list else 160.0
     QRS = np.median(qrs_list) if qrs_list else 85.0
     QT = np.median(qt_list) if qt_list else 400.0
     QTc = QT / np.sqrt(RR / 1000)
-
     return [RR, PR, QRS, QT, QTc, 60.0, 60.0, 45.0]
 
-# --- LAMBDA HANDLER ---
 def lambda_handler(event, context):
     global MODEL, SCALER, TARGET_SCALER
-    
     try:
-        # 1. Lazy Loading with Native TF-Keras
         if MODEL is None:
-            print("Initializing model loading...")
-            custom_objects = {'Dense': CustomDense}
-            
-            # Using tf.keras instead of standalone keras
-            MODEL = tf.keras.models.load_model(
-                'my_model.h5', 
-                custom_objects=custom_objects, 
-                compile=False
-            )
+            MODEL = robust_load_model('my_model.h5')
             SCALER = joblib.load('scaler.pkl')
             TARGET_SCALER = joblib.load('target_scaler.pkl')
-            print("Model and Scalers loaded successfully!")
+            print("Model loaded successfully!")
 
-        # 2. Request Parsing (Supporting both direct Test and API Gateway)
         uid = event.get('userId')
         if not uid and 'body' in event:
             body = event['body']
             if isinstance(body, str): body = json.loads(body)
             uid = body.get('uid')
-
         if not uid:
             return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
 
-        # 3. Firebase Data Fetch
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
-        
         if not snapshot:
-            return {'statusCode': 404, 'body': json.dumps("Error: No data found in Firebase")}
+            return {'statusCode': 404, 'body': json.dumps("Error: No data")}
 
         key = list(snapshot.keys())[0]
         data_entry = snapshot[key]
         raw_ecg_values = data_entry.get('values')
-
-        # 4. Feature Extraction
         features = extract_features(raw_ecg_values, fs=250)
         if features is None:
-            db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
-            return {'statusCode': 422, 'body': json.dumps("Poor signal quality")}
+            return {'statusCode': 422, 'body': json.dumps("Poor signal")}
 
-        # 5. Prediction Logic
         features_scaled = SCALER.transform([features])
         preds = MODEL.predict(features_scaled, verbose=0)
         
-        # Binary Classification (Imbalance)
         is_imbalanced = float(preds[0][0]) > 0.5 
-        
-        # Regression (Electrolyte levels)
         reg_out_real = TARGET_SCALER.inverse_transform(preds[1])[0]
         
-        k_val = round(float(reg_out_real[0]), 2)
-        ca_val = round(float(reg_out_real[1]), 2)
-        mg_val = round(float(reg_out_real[2]), 2)
+        k_val, ca_val, mg_val = round(float(reg_out_real[0]), 2), round(float(reg_out_real[1]), 2), round(float(reg_out_real[2]), 2)
 
-        # 6. Result Construction
         final_results = {
             "Potassium": {"Value": k_val, "Level": get_level(k_val, 3.5, 5.0), "Range": "3.5 - 5.0", "Unit": "mEq/L"},
             "Calcium": {"Value": ca_val, "Level": get_level(ca_val, 8.5, 10.5), "Range": "8.5 - 10.5", "Unit": "mg/dL"},
@@ -150,19 +135,8 @@ def lambda_handler(event, context):
             "Timestamp": data_entry.get('timestamp', 0)
         }
 
-        # Update Firebase Locations
         db.reference(f'users/{uid}/latest_results').set(final_results)
-        db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
-
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Content-Type': 'application/json'
-            },
-            'body': json.dumps(final_results)
-        }
+        return {'statusCode': 200, 'body': json.dumps(final_results)}
 
     except Exception as e:
-        print(f"System Error: {str(e)}")
         return {'statusCode': 500, 'body': json.dumps({"details": str(e)})}
