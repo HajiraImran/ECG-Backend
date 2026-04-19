@@ -1,24 +1,36 @@
-# Base image
+# Base image for AWS Lambda Python 3.10
 FROM public.ecr.aws/lambda/python:3.10
 
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip
+# 1. System dependencies
+RUN yum -y install \
+    gcc \
+    gcc-c++ \
+    make \
+    hdf5-devel \
+    && yum clean all
 
-# Install only required packages (lightweight)
+# 2. HDF5 paths set karein (h5py build fix)
+ENV H5PY_SETUP_REQUIRES=0
+ENV HDF5_DIR=/usr/lib64/hdf5
+
+# 3. Pip aur build tools update karein
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# 4. Requirements copy karein
+COPY requirements.txt .
+
+# 5. Install requirements 
+# Hum sirf --only-binary use karenge taaki build system confuse na ho
 RUN pip install --no-cache-dir \
-    tensorflow==2.19.0 \
-    numpy \
-    scipy \
-    scikit-learn \
-    joblib \
-    firebase-admin
+    --prefer-binary \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r requirements.txt
 
-# Copy project files
+# 6. Project files copy karein
 COPY lambda_function.py .
-COPY model_dir ./model_dir
+COPY my_model.h5 .
 COPY scaler.pkl .
-COPY target_scaler.pkl .
 COPY firebase_key.json .
 
 # Lambda handler
-CMD ["lambda_function.handler"]
+CMD ["lambda_function.lambda_handler"]
