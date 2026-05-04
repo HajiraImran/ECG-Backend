@@ -9,12 +9,14 @@ from scipy.signal import find_peaks, butter, lfilter
 
 # 1. Firebase Initialization
 if not firebase_admin._apps:
+    # Ensure 'firebase_key.json' is in your Docker root folder
     cred = credentials.Certificate('firebase_key.json')
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://trilyte-37e53-default-rtdb.firebaseio.com'
     })
 
-# 2. Global Model & Scaler
+# 2. Global Model & Scaler Loading
+# compile=False is used because we only need the model for inference (prediction)
 MODEL = tf.keras.models.load_model('my_model.h5', compile=False)
 SCALER = joblib.load('scaler.pkl') 
 
@@ -28,7 +30,7 @@ def extract_features(signal, fs=250):
     
     # --- Step 1: Bandpass Filter ---
     nyq = 0.5 * fs
-    low, high = 1.0 / nyq, 35.0 / nyq # 1.0Hz filter for better baseline
+    low, high = 1.0 / nyq, 35.0 / nyq 
     b, a = butter(1, [low, high], btype='band')
     filtered = lfilter(b, a, signal)
     
@@ -67,19 +69,22 @@ def extract_features(signal, fs=250):
     qt_avg = np.median(qt_list) if qt_list else 400.0
     qtc_avg = qt_avg / np.sqrt(rr_avg / 1000)
 
+    # Features order must match what the model was trained on
     return [rr_avg, 160.0, qrs_avg, qt_avg, qtc_avg, 50.0, 60.0, 45.0]
 
-def handler(event, context):
+def lambda_handler(event, context):
     try:
         # Request Parsing
         body = event.get('body', {})
-        if isinstance(body, str): body = json.loads(body)
+        if isinstance(body, str): 
+            body = json.loads(body)
+        
         uid = body.get('uid') or (event.get('queryStringParameters', {}).get('uid'))
 
         if not uid:
             return {'statusCode': 400, 'body': json.dumps("Error: Missing uid")}
 
-        # Get Latest Data
+        # Get Latest ECG Data from Firebase
         ref = db.reference(f'users/{uid}/ecg_data')
         snapshot = ref.order_by_child('timestamp').limit_to_last(1).get()
         
@@ -97,18 +102,27 @@ def handler(event, context):
             db.reference(f'users/{uid}/latest_results').update({"Status": "Signal Error: Stay Still"})
             return {'statusCode': 422, 'body': json.dumps({"error": "Poor signal quality"})}
 
-        # Prediction
+        # --- Prediction Logic ---
         features_scaled = SCALER.transform([features])
         preds = MODEL.predict(features_scaled)
         
+        # Multi-Output Unpacking:
+        # preds[0] -> Classification Output
+        # preds[1] -> Regression Output
+        class_out = preds[0][0] 
         reg_out = preds[1][0]
         
-        # --- Value Adjustments (Offsets) ---
-        k_val = round(float(reg_out[0]), 2)
-        ca_val = round(float(reg_out[1]) + 3.0, 2) # Adding 3.0 to bring it into 8-10 range
-        mg_val = round(float(reg_out[2]) + 1.2, 2) # Adding 1.2 to bring it into 1.7-2.2 range
+        # Handle Imbalance/Status using Classification probability
+        # If any column prediction is > 0.5, we flag it
+        is_abnormal = np.any(class_out > 0.5) 
+        status_display = "Review Required" if is_abnormal else "Normal"
 
-        # --- Formatting with Ranges for Dashboard ---
+        # Electrolyte values (Offsets Removed as requested)
+        k_val = round(float(reg_out[0]), 2)
+        ca_val = round(float(reg_out[1]), 2)
+        mg_val = round(float(reg_out[2]), 2)
+
+        # Formatting Results for Firebase and Dashboard
         final_results = {
             "Potassium": {
                 "Value": k_val, 
@@ -129,20 +143,26 @@ def handler(event, context):
                 "Unit": "mg/dL"
             },
             "BPM": round(60000 / features[0], 1),
-            "Status": "Normal", # This will replace "Analyzing" on the home screen
+            "Status": status_display, 
             "Timestamp": data_entry.get('timestamp', 0)
         }
 
-        # Save to Firebase
+        # Update Firebase Realtime Database
         db.reference(f'users/{uid}/latest_results').set(final_results)
         db.reference(f'users/{uid}/ecg_data/{key}/results').set(final_results)
 
         return {
             'statusCode': 200,
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps(final_results)
         }
 
     except Exception as e:
         print(f"System Error: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps({"details": str(e)})}
+        return {
+            'statusCode': 500, 
+            'body': json.dumps({"details": str(e)})
+        }
