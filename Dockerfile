@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir \
 
 # 6. Project files copy karein
 COPY lambda_function.py .
-COPY my_model.h5 .
+COPY my_model.keras .
 COPY scaler.pkl .
 COPY firebase_key.json .
 

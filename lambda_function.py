@@ -17,7 +17,7 @@ if not firebase_admin._apps:
 
 # 2. Global Model & Scaler Loading
 # compile=False is used because we only need the model for inference (prediction)
-MODEL = tf.keras.models.load_model('my_model.h5', compile=False)
+MODEL = tf.keras.models.load_model('my_model.keras', compile=False)
 SCALER = joblib.load('scaler.pkl') 
 
 def get_level(value, low, high):
