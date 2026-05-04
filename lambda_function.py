@@ -6,10 +6,6 @@ import joblib
 import firebase_admin
 from firebase_admin import credentials, db
 from scipy.signal import find_peaks, butter, lfilter
-from keras.layers import Dense
-
-
-
 
 # 1. Firebase Initialization
 if not firebase_admin._apps:
@@ -18,22 +14,9 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://trilyte-37e53-default-rtdb.firebaseio.com'
     })
-    
-    
-
-class PatchedDense(Dense):
-    def __init__(self, *args, **kwargs):
-        # quantization_config ko remove kar dena agar wo kwargs mein ho
-        kwargs.pop('quantization_config', None)
-        super().__init__(*args, **kwargs)
 
 # 2. Global Model & Scaler Loading
-# compile=False is used because we only need the model for inference (prediction)
-MODEL = tf.keras.models.load_model(
-    'my_model.keras', 
-    compile=False, 
-    custom_objects={'Dense': PatchedDense}
-)
+MODEL = tf.keras.models.load_model('my_model.h5', compile=False)
 SCALER = joblib.load('scaler.pkl') 
 
 def get_level(value, low, high):
