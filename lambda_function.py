@@ -103,12 +103,11 @@ def handler(event, context):
         
         reg_out = preds[1][0]
         
-        # --- Value Adjustments (Offsets) ---
+        
         k_val = round(float(reg_out[0]), 2)
-        ca_val = round(float(reg_out[1]) + 3.0, 2) 
-        mg_val = round(float(reg_out[2]) + 1.2, 2) 
-
-        # --- Formatting with Ranges for Dashboard ---
+        ca_val = round(float(reg_out[1]), 2) 
+        mg_val = round(float(reg_out[2]), 2)
+        
         final_results = {
             "Potassium": {
                 "Value": k_val, 
